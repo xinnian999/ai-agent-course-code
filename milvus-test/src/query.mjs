@@ -34,17 +34,30 @@ async function main() {
     const query = '我做饭或学习的日记';
     console.log(`Query: "${query}"\n`);
 
-    const queryVector = await getEmbedding(query);
-    const searchResult = await client.search({
-      collection_name: COLLECTION_NAME,
-      vector: queryVector,
-      limit: 2,
-      metric_type: MetricType.COSINE,
-      output_fields: ['id', 'content', 'date', 'mood', 'tags']
-    });
+    const subQueries = query.includes('或')
+      ? query.split('或').map(s => s.trim()).filter(Boolean)
+      : [query];
 
-    console.log(`Found ${searchResult.results.length} results:\n`);
-    searchResult.results.forEach((item, index) => {
+    const seen = new Map();
+    for (const q of subQueries) {
+      const vec = await getEmbedding(q);
+      const result = await client.search({
+        collection_name: COLLECTION_NAME,
+        vector: vec,
+        limit: 2,
+        metric_type: MetricType.COSINE,
+        output_fields: ['id', 'content', 'date', 'mood', 'tags']
+      });
+      for (const item of result.results) {
+        if (!seen.has(item.id) || seen.get(item.id).score < item.score) {
+          seen.set(item.id, item);
+        }
+      }
+    }
+
+    const results = [...seen.values()].sort((a, b) => b.score - a.score).slice(0, 2);
+    console.log(`Found ${results.length} results:\n`);
+    results.forEach((item, index) => {
       console.log(`${index + 1}. [Score: ${item.score.toFixed(4)}]`);
       console.log(`   ID: ${item.id}`);
       console.log(`   Date: ${item.date}`);

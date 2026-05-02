@@ -40,22 +40,34 @@ async function getEmbedding(text) {
 
 /**
  * 从 Milvus 中检索相关的日记条目
+ * 若问题含"或"，拆成多个子查询分别检索再合并，避免复合查询向量语义被单一概念主导
  */
 async function retrieveRelevantDiaries(question, k = 2) {
   try {
-    // 生成问题的向量
-    const queryVector = await getEmbedding(question);
+    const subQueries = question.includes('或')
+      ? question.split('或').map(s => s.trim()).filter(Boolean)
+      : [question];
 
-    // 在 Milvus 中搜索相似的日记
-    const searchResult = await client.search({
-      collection_name: COLLECTION_NAME,
-      vector: queryVector,
-      limit: k,
-      metric_type: MetricType.COSINE,
-      output_fields: ['id', 'content', 'date', 'mood', 'tags']
-    });
+    const seen = new Map();
+    for (const q of subQueries) {
+      const vec = await getEmbedding(q);
+      const result = await client.search({
+        collection_name: COLLECTION_NAME,
+        vector: vec,
+        limit: k,
+        metric_type: MetricType.COSINE,
+        output_fields: ['id', 'content', 'date', 'mood', 'tags']
+      });
+      for (const item of result.results) {
+        if (!seen.has(item.id) || seen.get(item.id).score < item.score) {
+          seen.set(item.id, item);
+        }
+      }
+    }
 
-    return searchResult.results;
+    return [...seen.values()]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, k);
   } catch (error) {
     console.error('检索日记时出错:', error.message);
     return [];

@@ -15,7 +15,7 @@ const GraphState = Annotation.Root({
 
 const model = new ChatOpenAI({
     temperature: 0,
-    model: "qwen-plus",
+    model: process.env.MODEL_NAME,
     configuration: {
         baseURL: process.env.OPENAI_BASE_URL,
     },
@@ -23,7 +23,7 @@ const model = new ChatOpenAI({
 });
 
 const embeddings = new OpenAIEmbeddings({
-    model: "text-embedding-v3",
+    model: process.env.EMBEDDINGS_MODEL_NAME,
     dimensions: 1024,
 });
 

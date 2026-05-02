@@ -6,15 +6,19 @@ import { Milvus } from "@langchain/community/vectorstores/milvus";
 
 const llm = new ChatOpenAI({
   temperature: 0,
-  model: "qwen-plus",
-  configuration: { baseURL: process.env.OPENAI_BASE_URL },
+  model: process.env.MODEL_NAME,
+  configuration: {
+    baseURL: process.env.OPENAI_BASE_URL,
+  },
   apiKey: process.env.OPENAI_API_KEY,
 });
 
 const embeddings = new OpenAIEmbeddings({
-  model: "text-embedding-v3",
+  model: process.env.EMBEDDINGS_MODEL_NAME,
   dimensions: 1024,
-  configuration: { baseURL: process.env.OPENAI_BASE_URL },
+  configuration: {
+    baseURL: process.env.OPENAI_BASE_URL
+  },
   apiKey: process.env.OPENAI_API_KEY,
 });
 
@@ -58,7 +62,11 @@ const routeQuestionNode = async (state) => {
   console.log("---ROUTE_QUESTION---");
   const router = llm.withStructuredOutput(RouteSchema);
   const route = await router.invoke(`
-你是问答路由器。请判断用户问题是否需要外部检索。
+你是问答路由器。请判断用户问题是否需要外部检索，并以 JSON 格式输出结果。
+
+字段要求：
+- strategy: 只能输出 simple 或 complex
+- reason: 简短说明理由
 
 规则：
 - simple: 常识问答、简短定义、无需特定小说细节即可回答。
@@ -118,7 +126,7 @@ const evaluateNode = async (state) => {
   const hasWeb = Boolean(state.webContext && String(state.webContext).trim());
   console.log(hasWeb ? "---EVALUATE_CONTEXT_WITH_WEB---" : "---EVALUATE_LOCAL_CONTEXT---");
   const evaluator = llm.withStructuredOutput(EvaluateSchema);
-  const out = await evaluator.invoke(`你是信息充分性评估器。判断当前上下文是否足以回答用户问题。
+  const out = await evaluator.invoke(`你是信息充分性评估器。请判断当前上下文是否足以回答用户问题，并以 JSON 格式输出结果。
 
 用户问题：${state.question}
 

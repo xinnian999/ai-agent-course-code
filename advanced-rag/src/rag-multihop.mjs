@@ -6,7 +6,7 @@ import { Milvus } from "@langchain/community/vectorstores/milvus";
 
 const llm = new ChatOpenAI({
   temperature: 0,
-  model: "qwen-plus",
+  model: process.env.MODEL_NAME,
   configuration: {
     baseURL: process.env.OPENAI_BASE_URL,
   },
@@ -14,13 +14,25 @@ const llm = new ChatOpenAI({
 });
 
 const embeddings = new OpenAIEmbeddings({
-  model: "text-embedding-v3",
+  model: process.env.EMBEDDINGS_MODEL_NAME,
   dimensions: 1024,
   configuration: {
     baseURL: process.env.OPENAI_BASE_URL,
   },
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+const ROUTE_STRATEGY = {
+  simple: "simple",
+  complex: "complex",
+};
+
+const NEXT_ACTION = {
+  retrieve: "retrieve",
+  generate: "generate",
+};
+
+const SUB_QUESTION_KEYS = ["question", "sub_question", "query", "text", "content"];
 
 /**
  * complex：先拆解子问题序列，再按序检索
@@ -75,20 +87,66 @@ function mergeUnique(existingDocs, newDocs) {
 }
 
 const RouteSchema = z.object({
-  strategy: z.enum(["simple", "complex"]),
+  strategy: z.string(),
   reason: z.string(),
 });
 
 const NextStepSchema = z.object({
-  nextAction: z.enum(["retrieve", "generate"]),
+  nextAction: z.string(),
   reason: z.string(),
 });
+
+const DecomposeSchema = z.object({
+  sub_questions: z.array(z.any()).min(1).max(8),
+  reason: z.string(),
+});
+
+function normalizeRouteStrategy(value) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (raw === ROUTE_STRATEGY.simple || raw.includes(ROUTE_STRATEGY.simple)) {
+    return ROUTE_STRATEGY.simple;
+  }
+  if (raw === ROUTE_STRATEGY.complex || raw.includes(ROUTE_STRATEGY.complex)) {
+    return ROUTE_STRATEGY.complex;
+  }
+  throw new Error(`route_question: 非法 strategy 输出: ${value}`);
+}
+
+function normalizeNextAction(value) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (raw === NEXT_ACTION.retrieve || raw.includes(NEXT_ACTION.retrieve)) {
+    return NEXT_ACTION.retrieve;
+  }
+  if (raw === NEXT_ACTION.generate || raw.includes(NEXT_ACTION.generate)) {
+    return NEXT_ACTION.generate;
+  }
+  throw new Error(`plan_next_step: 非法 nextAction 输出: ${value}`);
+}
+
+function normalizeSubQuestion(item) {
+  if (typeof item === "string") {
+    return item.trim();
+  }
+  if (item && typeof item === "object") {
+    for (const key of SUB_QUESTION_KEYS) {
+      const value = item[key];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+  }
+  return "";
+}
 
 const routeQuestionNode = async (state) => {
   console.log("---ROUTE_QUESTION---");
   const router = llm.withStructuredOutput(RouteSchema);
   const route = await router.invoke(`
-你是问答路由器。请判断用户问题是否需要外部检索。
+你是问答路由器。请判断用户问题是否需要外部检索，以 JSON 格式输出结果。
+
+字段要求：
+- strategy: 只能输出 simple 或 complex
+- reason: 简短说明理由
 
 规则：
 - simple: 常识问答、简短定义、无需特定小说细节即可回答。
@@ -96,10 +154,11 @@ const routeQuestionNode = async (state) => {
 
 用户问题：${state.question}
 `);
+  const strategy = normalizeRouteStrategy(route.strategy);
 
-  console.log(`路由策略: ${route.strategy} (${route.reason})`);
+  console.log(`路由策略: ${strategy} (${route.reason})`);
   return {
-    strategy: route.strategy,
+    strategy,
     routeReason: route.reason,
     retrievalCount: 0,
     maxRetrievals: state.maxRetrievals ?? 8,
@@ -110,15 +169,10 @@ const routeQuestionNode = async (state) => {
   };
 };
 
-const DecomposeSchema = z.object({
-  sub_questions: z.array(z.string()).min(1).max(8),
-  reason: z.string(),
-});
-
 const decomposeQuestionNode = async (state) => {
   console.log("---DECOMPOSE_QUESTION---");
   const decomposer = llm.withStructuredOutput(DecomposeSchema);
-  const out = await decomposer.invoke(`你是《天龙八部》多跳问答的「子问题拆解器」。
+  const out = await decomposer.invoke(`你是《天龙八部》多跳问答的「子问题拆解器」，请以 JSON 格式输出结果。
 
 用户原始问题：
 ${state.question}
@@ -129,10 +183,11 @@ ${state.question}
 3. 顺序必须符合推理链：先搞清前置实体/事实，再查后续结论。
 4. **不要**把整句原题原样复制成唯一一条（除非确实无法拆分）；不要拆成过碎的关键词列表。
 5. 输出 1～8 条即可。
+6. sub_questions 数组中的每一项都必须是字符串，不要输出对象。
 
 请输出 sub_questions 与简短 reason。`);
 
-  const subQuestions = out.sub_questions.map((s) => s.trim()).filter(Boolean);
+  const subQuestions = out.sub_questions.map(normalizeSubQuestion).filter(Boolean);
   if (subQuestions.length === 0) {
     throw new Error("decompose_question: sub_questions 为空");
   }
@@ -198,14 +253,18 @@ const planNextStepNode = async (state) => {
     state.documents.length === 0
       ? "（尚无检索结果）"
       : state.documents
-          .slice(0, 6)
-          .map(
-            (d, i) =>
-              `[${i + 1}] score=${Number(d.score).toFixed(4)} 第${d.chapter_num}章: ${d.content.slice(0, 200)}${d.content.length > 200 ? "..." : ""}`,
-          )
-          .join("\n\n");
+        .slice(0, 6)
+        .map(
+          (d, i) =>
+            `[${i + 1}] score=${Number(d.score).toFixed(4)} 第${d.chapter_num}章: ${d.content.slice(0, 200)}${d.content.length > 200 ? "..." : ""}`,
+        )
+        .join("\n\n");
 
-  const prompt = `你是多跳 RAG 规划器。检索查询已由前置步骤拆解为**有序子问题**；若需继续检索，下一轮将自动使用「下一条子问题」做向量检索，你**不要**自拟新的检索句。
+  const prompt = `你是多跳 RAG 规划器，请以 JSON 格式输出结果。检索查询已由前置步骤拆解为**有序子问题**；若需继续检索，下一轮将自动使用「下一条子问题」做向量检索，你**不要**自拟新的检索句。
+
+字段要求：
+- nextAction: 只能输出 retrieve 或 generate
+- reason: 简短说明理由
 
 用户原始问题：${state.question}
 
@@ -227,13 +286,14 @@ ${docStr}
 - 若已检索轮数已达到或超过最大检索轮数，必须 nextAction=generate。`;
 
   const model = llm.withStructuredOutput(NextStepSchema);
-  const { nextAction, reason } = await model.invoke(prompt);
+  const out = await model.invoke(prompt);
+  const nextAction = normalizeNextAction(out.nextAction);
 
   let finalNext = nextAction;
-  if (state.retrievalCount >= state.maxRetrievals) finalNext = "generate";
-  if (remaining <= 0) finalNext = "generate";
+  if (state.retrievalCount >= state.maxRetrievals) finalNext = NEXT_ACTION.generate;
+  if (remaining <= 0) finalNext = NEXT_ACTION.generate;
 
-  console.log(`[决策] plannedNext=${finalNext} (模型建议=${nextAction}) (${reason})`);
+  console.log(`[决策] plannedNext=${finalNext} (模型建议=${nextAction}) (${out.reason})`);
 
   return {
     plannedNext: finalNext,
@@ -241,11 +301,11 @@ ${docStr}
 };
 
 function afterRoute(state) {
-  return state.strategy === "simple" ? "direct_answer" : "decompose_question";
+  return state.strategy === ROUTE_STRATEGY.simple ? "direct_answer" : "decompose_question";
 }
 
 function afterPlan(state) {
-  return state.plannedNext === "retrieve" ? "retrieve" : "generate";
+  return state.plannedNext === NEXT_ACTION.retrieve ? "retrieve" : "generate";
 }
 
 const directAnswerNode = async (state) => {
@@ -278,21 +338,20 @@ const generateNode = async (state) => {
     .join("\n\n━━━━━\n\n");
   process.stdout.write("\n【AI 回答（流式）】\n");
   let generation = "";
-  const stream = await llm.stream(`你是一个专业的《天龙八部》小说助手。基于小说内容回答问题，用准确、详细的语言。
 
-请根据以下《天龙八部》小说片段内容回答问题：
-${context || "（未检索到相关内容）"}
+  const stream = await llm.stream(`你是一个中文小说问答助手。请仅依据给定检索片段，回答用户问题。
 
-用户问题: ${state.question}
+要求：
+1. 若片段足以回答，则先给出简洁结论，再用片段中的关键信息支撑。
+2. 若片段不足以完全确定，请明确说明“不确定/片段不足以确认”，并给出最接近的依据。
+3. 不要编造未出现在片段中的情节。
 
-回答要求：
-1. 如果片段中有相关信息，请结合小说内容给出详细、准确的回答
-2. 可以综合多个片段的内容，提供完整的答案
-3. 如果片段中没有相关信息，请如实告知用户
-4. 回答要准确，符合小说的情节和人物设定
-5. 可以引用原文内容来支持你的回答
+用户问题：${state.question}
 
-AI 助手的回答:`);
+检索片段：
+${context || "（无检索结果）"}
+`);
+
   for await (const chunk of stream) {
     const text = typeof chunk.content === "string" ? chunk.content : "";
     if (!text) continue;
@@ -300,6 +359,7 @@ AI 助手的回答:`);
     process.stdout.write(text);
   }
   process.stdout.write("\n");
+
   return { generation };
 };
 
@@ -325,14 +385,7 @@ const graph = new StateGraph(GraphState)
   .addEdge("generate", END)
   .compile();
 
-async function main() {
-  const question =
-    "《天龙八部》中「四大恶人」排行第二的是谁？此人之子在身世揭晓前，其生父在武林中的公开身份是什么？";
-  const k = 5;
-
-  const drawable = await graph.getGraphAsync();
-  console.log(drawable.drawMermaid({ withStyles: true }));
-
+async function initVectorStore() {
   console.log("连接到 Milvus...");
   vectorStore = await Milvus.fromExistingCollection(embeddings, {
     collectionName: "ebook_collection",
@@ -348,30 +401,35 @@ async function main() {
     },
   });
   vectorStore.indexSearchParams = { metric_type: "COSINE", params: JSON.stringify({ ef: 64 }) };
-  console.log("✓ 已连接\n");
+  console.log("✓ 已连接");
 
   try {
     await vectorStore.client.loadCollection({ collection_name: "ebook_collection" });
-    console.log("✓ 集合 ebook_collection 已加载\n");
+    console.log("\n✓ 集合 ebook_collection 已加载");
   } catch (error) {
     if (!error.message.includes("already loaded")) {
       throw error;
     }
-    console.log("✓ 集合 ebook_collection 已处于加载状态\n");
+    console.log("\n✓ 集合 ebook_collection 已处于加载状态");
   }
+}
 
-  console.log("=".repeat(80));
+async function main() {
+  await initVectorStore();
+
+  const question = "《天龙八部》中「四大恶人」排行第二的是谁？此人之子在身世揭晓前，其生父在武林中的公开身份是什么？";
+  console.log("\n" + "=".repeat(80));
   console.log(`问题: ${question}`);
   console.log("=".repeat(80));
 
   const result = await graph.invoke({
     question,
-    k: Number.isFinite(k) ? k : 5,
+    k: 3,
     strategy: "",
     routeReason: "",
+    documents: [],
     subQuestions: [],
     nextSubIdx: 0,
-    documents: [],
     currentQuery: "",
     retrievalCount: 0,
     maxRetrievals: 8,
